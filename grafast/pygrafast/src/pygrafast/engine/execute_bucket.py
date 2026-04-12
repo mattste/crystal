@@ -72,6 +72,7 @@ def _execute_step(step: Step[Any], bucket: Bucket) -> None:
             dep_values.append(ExecutionValue(is_unary=True, unary_value=None))
 
     details = ExecutionDetails(count=bucket.size, values=dep_values)
+    details._bucket = bucket  # type: ignore[attr-defined]
 
     # Execute the step
     try:
@@ -82,7 +83,8 @@ def _execute_step(step: Step[Any], bucket: Bucket) -> None:
         results = [flagged] * bucket.size
 
     # Store results
-    if step._is_unary and bucket.size == 1:
+    if step._is_unary:
+        # Unary step — store single value (not the list)
         bucket.store[step.id] = results[0] if results else None
     else:
         bucket.store[step.id] = results

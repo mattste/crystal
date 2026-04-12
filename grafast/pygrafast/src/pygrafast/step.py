@@ -22,13 +22,14 @@ TData = TypeVar("TData")
 class ExecutionDetails:
     """Details passed to Step.execute()."""
 
-    __slots__ = ("count", "values")
+    __slots__ = ("count", "values", "_bucket")
 
     def __init__(
         self, count: int, values: list[ExecutionValue]
     ) -> None:
         self.count = count
         self.values = values
+        self._bucket: Any = None
 
 
 class ExecutionValue:

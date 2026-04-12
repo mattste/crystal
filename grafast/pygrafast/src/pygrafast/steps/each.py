@@ -56,6 +56,8 @@ class EachStep(Step[list[Any]]):
     def execute(self, details: ExecutionDetails) -> list[list[Any] | None]:
         """Execute by iterating over each list and batch-executing the sub-step."""
         results: list[list[Any] | None] = []
+        # Get parent bucket reference for copying unary values
+        parent_bucket = getattr(details, '_bucket', None)
 
         for i in range(details.count):
             list_value = details.values[0].at(i)
@@ -68,25 +70,38 @@ class EachStep(Step[list[Any]]):
                 results.append(None)
                 continue
 
-            # For each item in the list, we need to execute the sub-step chain.
-            # The sub-step chain starts from _item_step and ends at _result_step.
-            # We need to execute all steps between them for each batch of items.
-            from ..engine.execute_bucket import Bucket, execute_bucket
+            if len(list_value) == 0:
+                results.append([])
+                continue
+
+            from ..engine.execute_bucket import Bucket
 
             sub_bucket = Bucket(self.layer_plan, len(list_value))
 
             # Store list items in the item_step's slot
             sub_bucket.store[self._item_step.id] = list(list_value)
 
-            # Also copy over any unary values from the parent bucket that
-            # sub-steps might depend on
-            parent_bucket = details._bucket if hasattr(details, '_bucket') else None
+            # Copy unary values from the parent bucket for steps that
+            # sub-steps may depend on (e.g., ContextStep, ValueStep)
+            if parent_bucket is not None:
+                for step in self.operation_plan.step_tracker.all_steps():
+                    if step._no_exec and step._is_unary:
+                        if step.id in parent_bucket.store:
+                            sub_bucket.store[step.id] = parent_bucket.store[step.id]
+                        else:
+                            # For ContextSteps created during sub-plan,
+                            # look for a matching value in any parent ContextStep
+                            from .context_step import ContextStep
+                            if isinstance(step, ContextStep):
+                                # Find any context value from parent
+                                for pid, pval in parent_bucket.store.items():
+                                    parent_step = self.operation_plan.step_tracker.get_step_by_id(pid)
+                                    if isinstance(parent_step, ContextStep):
+                                        sub_bucket.store[step.id] = pval
+                                        break
 
-            # Execute all steps that are between item_step and result_step
-            # We need to find and execute the dependency chain
             self._execute_substeps(sub_bucket, list_value)
 
-            # Read results from the result step
             result_values = sub_bucket.store.get(self._result_step.id)
             if isinstance(result_values, list):
                 results.append(result_values)

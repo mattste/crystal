@@ -334,10 +334,7 @@ def make_base_args() -> dict[str, Any]:
                         get(crawler_step, "bestFriend"),
                         {"load": batch_get_crawler_by_id, "shared": context().get("dccDb")},
                     ),
-                    "friends": lambda crawler_step, field_args: load_many(
-                        get(crawler_step, "id"),
-                        {"load": batch_get_friend_ids_by_crawler_id, "shared": context().get("dccDb")},
-                    ),
+                    "friends": _plan_active_crawler_friends,
                     "items": lambda crawler_step, field_args: lambda_(
                         [get(crawler_step, "items"), field_args.get_raw("first")],
                         _apply_limit,
@@ -473,6 +470,45 @@ def make_base_args() -> dict[str, Any]:
         "context_value": {"dccDb": dcc_db},
         "variable_values": {},
     }
+
+
+def _plan_active_crawler_friends(crawler_step: Any, field_args: Any) -> Any:
+    """Plan ActiveCrawler.friends - returns [Character] via friend IDs.
+
+    In the TS version, the friends field returns raw IDs and the bucket system
+    resolves them through Character.planType. In Python, we resolve explicitly
+    via each().
+    """
+    crawler_id = get(crawler_step, "id")
+    db_step = context().get("dccDb")
+    friend_ids = load_many(
+        crawler_id,
+        {"load": batch_get_friend_ids_by_crawler_id, "shared": db_step},
+    )
+
+    # Resolve each friend ID through Character loading
+    def resolve_friend(friend_id_step: Any) -> Any:
+        """Resolve a single friend ID to a Character."""
+        db = context().get("dccDb")
+
+        # Try loading as crawler (100-199)
+        crawler_id_step = lambda_(friend_id_step, _extract_crawler_id)
+        crawler = load_one(
+            crawler_id_step,
+            {"load": batch_get_crawler_by_id, "shared": db},
+        )
+
+        # Try loading as NPC (300-399)
+        npc_id_step = lambda_(friend_id_step, _extract_npc_id)
+        npc = load_one(
+            npc_id_step,
+            {"load": batch_get_npc_by_id, "shared": db},
+        )
+
+        # Coalesce — return whichever loaded successfully
+        return lambda_([crawler, npc], _coalesce_values)
+
+    return each(friend_ids, resolve_friend)
 
 
 def _plan_character_type(specifier_step: Any) -> dict[str, Any]:

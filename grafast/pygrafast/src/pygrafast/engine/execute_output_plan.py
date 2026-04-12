@@ -130,28 +130,10 @@ def _execute_array_output(
                     result.append(item)
             else:
                 result.append(item)
-        elif elem_output.mode == "object":
-            # For object elements, we need the item's properties
-            # The step results are already the full objects from EachStep
+        elif elem_output.mode in ("object", "polymorphic"):
+            # For object/polymorphic elements, extract selected fields from the dict
             if isinstance(item, dict):
-                obj: dict[str, Any] = {}
-                for key in elem_output.keys:
-                    child_out, child_step = elem_output.children[key]
-                    if child_out.mode == "leaf":
-                        val = item.get(key)
-                        if child_out.serializer is not None and val is not None:
-                            try:
-                                val = child_out.serializer(val)
-                            except Exception:
-                                pass
-                        obj[key] = val
-                    elif child_out.mode == "object":
-                        obj[key] = _extract_object_from_item(child_out, item.get(key))
-                    elif child_out.mode == "array":
-                        obj[key] = _extract_array_from_item(child_out, item.get(key))
-                    else:
-                        obj[key] = item.get(key)
-                result.append(obj)
+                result.append(_extract_object_from_item(elem_output, item))
             else:
                 result.append(None)
         else:
@@ -171,22 +153,51 @@ def _extract_object_from_item(
         return None
 
     result: dict[str, Any] = {}
+
+    # Extract common fields
     for key in output_plan.keys:
-        child_out, _ = output_plan.children[key]
-        val = item.get(key)
-        if child_out.mode == "leaf":
-            if child_out.serializer is not None and val is not None:
-                try:
-                    val = child_out.serializer(val)
-                except Exception:
-                    pass
-            result[key] = val
-        elif child_out.mode == "object":
-            result[key] = _extract_object_from_item(child_out, val)
-        elif child_out.mode == "array":
-            result[key] = _extract_array_from_item(child_out, val)
-        else:
-            result[key] = val
+        if key in output_plan.children:
+            child_out, _ = output_plan.children[key]
+            val = item.get(key)
+            if child_out.mode == "leaf":
+                if child_out.serializer is not None and val is not None:
+                    try:
+                        val = child_out.serializer(val)
+                    except Exception:
+                        pass
+                result[key] = val
+            elif child_out.mode in ("object", "polymorphic"):
+                result[key] = _extract_object_from_item(child_out, val)
+            elif child_out.mode == "array":
+                result[key] = _extract_array_from_item(child_out, val)
+            else:
+                result[key] = val
+
+    # For polymorphic mode, also extract type-specific fields
+    if output_plan.mode == "polymorphic":
+        # Determine the __typename from the item
+        typename = item.get("__typename") or item.get("type")
+        if typename and typename in output_plan.type_keys:
+            type_keys = output_plan.type_keys[typename]
+            type_children = output_plan.type_children.get(typename, {})
+            for key in type_keys:
+                if key in type_children:
+                    child_out, _ = type_children[key]
+                    val = item.get(key)
+                    if child_out.mode == "leaf":
+                        if child_out.serializer is not None and val is not None:
+                            try:
+                                val = child_out.serializer(val)
+                            except Exception:
+                                pass
+                        result[key] = val
+                    elif child_out.mode in ("object", "polymorphic"):
+                        result[key] = _extract_object_from_item(child_out, val)
+                    elif child_out.mode == "array":
+                        result[key] = _extract_array_from_item(child_out, val)
+                    else:
+                        result[key] = val
+
     return result
 
 
