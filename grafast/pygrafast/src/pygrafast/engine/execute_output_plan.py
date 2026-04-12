@@ -23,6 +23,8 @@ def execute_output_plan(
         return _execute_leaf_output(output_plan, bucket, index)
     elif mode == "polymorphic":
         return _execute_polymorphic_output(output_plan, bucket, index)
+    elif mode == "array":
+        return _execute_array_output(output_plan, bucket, index)
     elif mode == "null":
         return None
     else:
@@ -90,6 +92,114 @@ def _execute_polymorphic_output(
                 result[key] = execute_output_plan(child_output, bucket, index)
 
     return result
+
+
+def _execute_array_output(
+    output_plan: OutputPlan,
+    bucket: Bucket,
+    index: int,
+) -> list[Any] | None:
+    """Build an array result from the output plan."""
+    step = output_plan.root_step
+    if step is None:
+        return None
+
+    list_value = _get_step_value(step, bucket, index)
+
+    if list_value is None or is_flagged_value(list_value):
+        return None
+
+    if not isinstance(list_value, (list, tuple)):
+        return None
+
+    elem_output = output_plan.element_output
+    if elem_output is None:
+        # No element output plan — just return the raw values
+        return list(list_value)
+
+    # For each element, build its output
+    result: list[Any] = []
+    for item in list_value:
+        if item is None or is_flagged_value(item):
+            result.append(None)
+        elif elem_output.mode == "leaf":
+            if elem_output.serializer is not None:
+                try:
+                    result.append(elem_output.serializer(item))
+                except Exception:
+                    result.append(item)
+            else:
+                result.append(item)
+        elif elem_output.mode == "object":
+            # For object elements, we need the item's properties
+            # The step results are already the full objects from EachStep
+            if isinstance(item, dict):
+                obj: dict[str, Any] = {}
+                for key in elem_output.keys:
+                    child_out, child_step = elem_output.children[key]
+                    if child_out.mode == "leaf":
+                        val = item.get(key)
+                        if child_out.serializer is not None and val is not None:
+                            try:
+                                val = child_out.serializer(val)
+                            except Exception:
+                                pass
+                        obj[key] = val
+                    elif child_out.mode == "object":
+                        obj[key] = _extract_object_from_item(child_out, item.get(key))
+                    elif child_out.mode == "array":
+                        obj[key] = _extract_array_from_item(child_out, item.get(key))
+                    else:
+                        obj[key] = item.get(key)
+                result.append(obj)
+            else:
+                result.append(None)
+        else:
+            result.append(item)
+
+    return result
+
+
+def _extract_object_from_item(
+    output_plan: OutputPlan,
+    item: Any,
+) -> dict[str, Any] | None:
+    """Extract object fields from an item dict using the output plan."""
+    if item is None:
+        return None
+    if not isinstance(item, dict):
+        return None
+
+    result: dict[str, Any] = {}
+    for key in output_plan.keys:
+        child_out, _ = output_plan.children[key]
+        val = item.get(key)
+        if child_out.mode == "leaf":
+            if child_out.serializer is not None and val is not None:
+                try:
+                    val = child_out.serializer(val)
+                except Exception:
+                    pass
+            result[key] = val
+        elif child_out.mode == "object":
+            result[key] = _extract_object_from_item(child_out, val)
+        elif child_out.mode == "array":
+            result[key] = _extract_array_from_item(child_out, val)
+        else:
+            result[key] = val
+    return result
+
+
+def _extract_array_from_item(
+    output_plan: OutputPlan,
+    items: Any,
+) -> list[Any] | None:
+    """Extract array from items."""
+    if items is None:
+        return None
+    if not isinstance(items, (list, tuple)):
+        return None
+    return list(items)
 
 
 def _execute_leaf_output(

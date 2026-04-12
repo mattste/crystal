@@ -334,8 +334,67 @@ class OperationPlan:
         while isinstance(unwrapped_type, GraphQLNonNull):
             unwrapped_type = unwrapped_type.of_type
 
+        # Handle list types: unwrap [Type] -> Type
+        is_list = False
+        if isinstance(unwrapped_type, GraphQLList):
+            is_list = True
+            unwrapped_type = unwrapped_type.of_type
+            # Further unwrap NonNull inside the list
+            while isinstance(unwrapped_type, GraphQLNonNull):
+                unwrapped_type = unwrapped_type.of_type
+
         # Determine output mode based on the field's return type
-        if is_leaf_type(unwrapped_type):
+        if is_list:
+            # Array output mode
+            child_output = OutputPlan(layer_plan, mode="array")
+            child_output.root_step = result_step
+
+            # Create the element output plan
+            if is_leaf_type(unwrapped_type):
+                elem_output = OutputPlan(layer_plan, mode="leaf")
+                if isinstance(unwrapped_type, GraphQLScalarType):
+                    elem_output.serializer = unwrapped_type.serialize
+                elif isinstance(unwrapped_type, GraphQLEnumType):
+                    elem_output.serializer = unwrapped_type.serialize
+            elif isinstance(unwrapped_type, GraphQLObjectType):
+                elem_output = OutputPlan(layer_plan, mode="object")
+                if field_node.selection_set:
+                    self._plan_selection_set(
+                        field_node.selection_set,
+                        unwrapped_type,
+                        result_step,
+                        elem_output,
+                        layer_plan,
+                    )
+            elif is_abstract_type(unwrapped_type):
+                elem_output = OutputPlan(layer_plan, mode="polymorphic")
+                plan_type_fn = self._get_plan_type(unwrapped_type)
+                if plan_type_fn is not None:
+                    def call_plan_type_list() -> Step[Any]:
+                        plan_result = plan_type_fn(result_step)
+                        if isinstance(plan_result, dict):
+                            typename_step = plan_result.get("$__typename")
+                            elem_output.typename_step = typename_step
+                            plan_for_type = plan_result.get("planForType")
+                            if plan_for_type is not None:
+                                elem_output.plan_for_type = plan_for_type
+                            return typename_step
+                        return None  # type: ignore
+                    with_global_layer_plan(layer_plan, None, call_plan_type_list)
+                if field_node.selection_set:
+                    self._plan_selection_set(
+                        field_node.selection_set,
+                        unwrapped_type,
+                        result_step,
+                        elem_output,
+                        layer_plan,
+                    )
+            else:
+                elem_output = OutputPlan(layer_plan, mode="leaf")
+
+            child_output.element_output = elem_output
+
+        elif is_leaf_type(unwrapped_type):
             child_output = OutputPlan(layer_plan, mode="leaf")
             child_output.root_step = result_step
             # Get serializer for scalar types

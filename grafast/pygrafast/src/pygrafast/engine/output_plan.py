@@ -41,3 +41,6 @@ class OutputPlan:
         self.type_keys: dict[str, list[str]] = {}
         # type plans: type_name -> (keys_list, type_obj)
         self.type_plans: dict[str, tuple[list[str], Any]] = {}
+
+        # For array mode: the output plan for each element
+        self.element_output: OutputPlan | None = None
