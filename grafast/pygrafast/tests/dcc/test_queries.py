@@ -79,23 +79,67 @@ def dcc_base_args():
     return make_base_args()
 
 
-# Start with just the 'friends' fixture as the first target
-@pytest.mark.asyncio
-async def test_friends_fixture(dcc_base_args):
-    """Execute friends.test.graphql and compare to friends.json5."""
-    graphql_file = FIXTURES_DIR / "friends.test.graphql"
-    if not graphql_file.exists():
-        pytest.skip("Fixture file not found")
+def get_non_incremental_cases() -> list[tuple[str, Path]]:
+    """Get test cases that don't require incremental delivery."""
+    all_cases = discover_test_cases()
+    result = []
+    for name, path in all_cases:
+        source = path.read_text()
+        # Skip tests with @incremental directive (defer/stream)
+        if "@incremental" in source:
+            continue
+        result.append((name, path))
+    return result
 
+
+@pytest.mark.parametrize(
+    "base_name,graphql_file",
+    get_non_incremental_cases(),
+    ids=[name for name, _ in get_non_incremental_cases()],
+)
+@pytest.mark.asyncio
+async def test_dcc_fixture(base_name: str, graphql_file: Path, dcc_base_args):
+    """Execute a .test.graphql fixture and compare to .json5 snapshot."""
     source = graphql_file.read_text()
-    expected = load_json5_fixture("friends")
-    assert expected is not None, "Expected .json5 fixture not found"
+
+    from graphql import parse as gql_parse
+    from graphql.language import OperationType
+
+    document = gql_parse(source)
+    operations = [d for d in document.definitions
+                  if hasattr(d, 'operation')]
+
+    # Use the first operation
+    op = operations[0]
+    operation_name = op.name.value if op.name else None
+
+    # Extract variable values from @variables directive
+    variable_values: dict[str, Any] = {}
+    expect_error = False
+    if op.directives:
+        for directive in op.directives:
+            if directive.name.value == "variables":
+                for arg in directive.arguments or []:
+                    if arg.name.value == "values":
+                        from graphql.utilities import value_from_ast_untyped
+                        variable_values = value_from_ast_untyped(arg.value)
+            if directive.name.value == "expectError":
+                expect_error = True
 
     result = await grafast(
         schema=dcc_base_args["schema"],
         source=source,
         context_value=dcc_base_args["context_value"],
+        variable_values=variable_values,
+        operation_name=operation_name,
     )
 
-    assert result.errors is None, f"Unexpected errors: {result.errors}"
-    assert result.data == expected
+    expected = load_json5_fixture(base_name)
+    if expected is None:
+        pytest.skip(f"No .json5 fixture for {base_name}")
+
+    if expect_error:
+        assert result.errors is not None
+    else:
+        assert result.errors is None, f"Unexpected errors: {result.errors}"
+        assert result.data == expected
