@@ -315,12 +315,15 @@ def make_base_args() -> dict[str, Any]:
                         field_args.get_raw("id"),
                         {"load": batch_get_crawler_by_id, "shared": context().get("dccDb")},
                     ),
-                    "character": lambda _parent, field_args: field_args.get_raw("id"),
+                    "character": _plan_query_character,
                     "floor": lambda _parent, field_args: lambda_(
                         field_args.get_raw("number"),
                         _get_floor,
                     ),
-                    "npc": lambda _parent, field_args: field_args.get_raw("id"),
+                    "npc": lambda _parent, field_args: load_one(
+                        field_args.get_raw("id"),
+                        {"load": batch_get_npc_by_id, "shared": context().get("dccDb")},
+                    ),
                     "brokenItem": lambda _parent, _field_args: constant("Utility:999"),
                     "item": lambda _parent, field_args: lambda_(
                         [field_args.get_raw("type"), field_args.get_raw("id")],
@@ -344,10 +347,7 @@ def make_base_args() -> dict[str, Any]:
             },
             "Manager": {
                 "plans": {
-                    "friends": lambda npc_step, field_args: lambda_(
-                        [get(npc_step, "friends"), field_args.get_raw("first")],
-                        _apply_limit,
-                    ),
+                    "friends": _plan_npc_friends,
                     "bestFriend": lambda npc_step, _fa: get(npc_step, "bestFriend"),
                     "client": lambda manager_step, _fa: load_one(
                         get(manager_step, "client"),
@@ -361,10 +361,7 @@ def make_base_args() -> dict[str, Any]:
             },
             "Security": {
                 "plans": {
-                    "friends": lambda npc_step, field_args: lambda_(
-                        [get(npc_step, "friends"), field_args.get_raw("first")],
-                        _apply_limit,
-                    ),
+                    "friends": _plan_npc_friends,
                     "bestFriend": lambda npc_step, _fa: get(npc_step, "bestFriend"),
                     "clients": lambda security_step, _fa: each(
                         get(security_step, "clients"),
@@ -377,19 +374,13 @@ def make_base_args() -> dict[str, Any]:
             },
             "Guide": {
                 "plans": {
-                    "friends": lambda npc_step, field_args: lambda_(
-                        [get(npc_step, "friends"), field_args.get_raw("first")],
-                        _apply_limit,
-                    ),
+                    "friends": _plan_npc_friends,
                     "bestFriend": lambda npc_step, _fa: get(npc_step, "bestFriend"),
                 },
             },
             "Staff": {
                 "plans": {
-                    "friends": lambda npc_step, field_args: lambda_(
-                        [get(npc_step, "friends"), field_args.get_raw("first")],
-                        _apply_limit,
-                    ),
+                    "friends": _plan_npc_friends,
                     "bestFriend": lambda npc_step, _fa: get(npc_step, "bestFriend"),
                     "items": lambda npc_step, field_args: lambda_(
                         [get(npc_step, "items"), field_args.get_raw("first")],
@@ -472,6 +463,53 @@ def make_base_args() -> dict[str, Any]:
     }
 
 
+def _plan_query_character(_parent: Any, field_args: Any) -> Any:
+    """Plan Query.character - resolves a character by ID.
+
+    Loads either a crawler (100-199) or NPC (300-399) depending on the ID.
+    """
+    id_step = field_args.get_raw("id")
+    db_step = context().get("dccDb")
+
+    crawler_id_step = lambda_(id_step, _extract_crawler_id)
+    crawler_step = load_one(
+        crawler_id_step,
+        {"load": batch_get_crawler_by_id, "shared": db_step},
+    )
+
+    npc_id_step = lambda_(id_step, _extract_npc_id)
+    npc_step = load_one(
+        npc_id_step,
+        {"load": batch_get_npc_by_id, "shared": db_step},
+    )
+
+    # Return whichever loaded successfully
+    return lambda_([crawler_step, npc_step], _coalesce_values)
+
+
+def _plan_npc_friends(npc_step: Any, field_args: Any) -> Any:
+    """Plan NPC friends - resolves friend IDs to Character objects with limit."""
+    friends_list = get(npc_step, "friends")
+    first = field_args.get_raw("first")
+    limited = lambda_([friends_list, first], _apply_limit)
+
+    def resolve_friend(friend_id_step: Any) -> Any:
+        db = context().get("dccDb")
+        crawler_id = lambda_(friend_id_step, _extract_crawler_id)
+        crawler = load_one(
+            crawler_id,
+            {"load": batch_get_crawler_by_id, "shared": db},
+        )
+        npc_id = lambda_(friend_id_step, _extract_npc_id)
+        npc = load_one(
+            npc_id,
+            {"load": batch_get_npc_by_id, "shared": db},
+        )
+        return lambda_([crawler, npc], _coalesce_values)
+
+    return each(limited, resolve_friend)
+
+
 def _plan_active_crawler_friends(crawler_step: Any, field_args: Any) -> Any:
     """Plan ActiveCrawler.friends - returns [Character] via friend IDs.
 
@@ -486,70 +524,61 @@ def _plan_active_crawler_friends(crawler_step: Any, field_args: Any) -> Any:
         {"load": batch_get_friend_ids_by_crawler_id, "shared": db_step},
     )
 
-    # Resolve each friend ID through Character loading
+    # Resolve each friend ID through Character loading.
+    # Each friend can be a crawler (100-199) or NPC (300-399).
     def resolve_friend(friend_id_step: Any) -> Any:
-        """Resolve a single friend ID to a Character."""
+        """Resolve a single friend ID to a Character object."""
         db = context().get("dccDb")
 
-        # Try loading as crawler (100-199)
-        crawler_id_step = lambda_(friend_id_step, _extract_crawler_id)
+        crawler_id = lambda_(friend_id_step, _extract_crawler_id)
         crawler = load_one(
-            crawler_id_step,
+            crawler_id,
             {"load": batch_get_crawler_by_id, "shared": db},
         )
 
-        # Try loading as NPC (300-399)
-        npc_id_step = lambda_(friend_id_step, _extract_npc_id)
+        npc_id = lambda_(friend_id_step, _extract_npc_id)
         npc = load_one(
-            npc_id_step,
+            npc_id,
             {"load": batch_get_npc_by_id, "shared": db},
         )
 
-        # Coalesce — return whichever loaded successfully
         return lambda_([crawler, npc], _coalesce_values)
 
     return each(friend_ids, resolve_friend)
 
 
-def _plan_character_type(specifier_step: Any) -> dict[str, Any]:
+def _character_to_type_name(obj: Any) -> str | None:
+    """Determine __typename from a loaded character object."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        # Check if it's a crawler
+        if "species" in obj and "deleted" not in obj or (isinstance(obj.get("deleted"), bool) and not obj["deleted"]):
+            return "ActiveCrawler"
+        if obj.get("deleted"):
+            return "DeletedCrawler"
+        # Check if it's an NPC
+        if "type" in obj:
+            return _npc_to_type_name(obj)
+    return None
+
+
+def _plan_character_type(character_step: Any) -> dict[str, Any]:
     """Plan Character interface resolution.
 
-    Characters are identified by ID: 100-199 = Crawler, 300-399 = NPC.
+    In our simplified version, character_step is already a loaded object
+    (either a crawler dict or NPC dict). We just need to determine __typename.
     """
-    db_step = context().get("dccDb")
-
-    # Try as crawler
-    crawler_id_step = lambda_(specifier_step, _extract_crawler_id)
-    crawler_step = load_one(
-        crawler_id_step,
-        {"load": batch_get_crawler_by_id, "shared": db_step},
-    )
-    crawler_typename = lambda_(crawler_step, _crawler_to_type_name)
-
-    # Try as NPC
-    npc_id_step = lambda_(specifier_step, _extract_npc_id)
-    npc_step = load_one(
-        npc_id_step,
-        {"load": batch_get_npc_by_id, "shared": db_step},
-    )
-    npc_typename = lambda_(npc_step, _npc_to_type_name)
-
-    # Coalesce typenames
-    typename_step = lambda_(
-        [crawler_typename, npc_typename],
-        _coalesce_values,
-    )
-
+    typename_step = lambda_(character_step, _character_to_type_name)
     return {"$__typename": typename_step}
 
 
-def _plan_npc_type(npc_id_step: Any) -> dict[str, Any]:
-    """Plan NPC interface resolution."""
-    db_step = context().get("dccDb")
-    npc_step = load_one(
-        npc_id_step,
-        {"load": batch_get_npc_by_id, "shared": db_step},
-    )
+def _plan_npc_type(npc_step: Any) -> dict[str, Any]:
+    """Plan NPC interface resolution.
+
+    In the simplified Python version, npc_step is already a loaded NPC object
+    (not just an ID) since Query.npc does the loadOne.
+    """
     typename_step = lambda_(npc_step, _npc_to_type_name)
     return {"$__typename": typename_step}
 
