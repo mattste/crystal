@@ -71,11 +71,17 @@ async def grafast(
     # Create and execute the root bucket
     bucket = new_bucket(op_plan.root_layer_plan, size=1)
 
-    # Inject unary values for __ValueStep instances
+    # Inject unary values for _no_exec steps (ValueStep, ContextStep, etc.)
+    from .steps.context_step import ContextStep
+
     for step in op_plan.step_tracker.all_steps():
         if step._no_exec and step._is_unary:
-            # This is a __ValueStep — inject a placeholder value
-            bucket.set_unary(step.id, {})
+            if isinstance(step, ContextStep):
+                # Inject the context value
+                bucket.set_unary(step.id, context_value or {})
+            else:
+                # ValueStep — inject empty root value
+                bucket.set_unary(step.id, {})
 
     # Inject variable values for InputStaticLeafStep and TrackedValueStep
     # (these are already baked into the step at planning time)

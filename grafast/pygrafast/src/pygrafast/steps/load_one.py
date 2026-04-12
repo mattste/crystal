@@ -45,10 +45,10 @@ class LoadOneStep(Step[Any]):
         for i in range(details.count):
             keys.append(details.values[0].at(i))
 
-        # Get shared value if present
-        extra = None
+        # Build extra dict with shared value
+        extra: dict[str, Any] = {}
         if self._shared_dep_id is not None:
-            extra = details.values[1].at(0)
+            extra["shared"] = details.values[1].at(0)
 
         # Call the batch loader
         results = self._load(keys, extra)
