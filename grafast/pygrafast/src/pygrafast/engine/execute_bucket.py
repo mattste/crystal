@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..constants import FLAG_ERROR, NO_FLAGS, ExecutionEntryFlags
+from ..constants import DEFAULT_FORBIDDEN_FLAGS, FLAG_ERROR, FLAG_NULL, NO_FLAGS, ExecutionEntryFlags
 from ..error import FlaggedValue, is_flagged_value
 from ..step import ExecutionDetails, ExecutionValue, Step
 from .layer_plan import LayerPlan
@@ -57,8 +57,88 @@ def execute_bucket(bucket: Bucket) -> None:
             _execute_step(step, bucket)
 
 
+def _get_dep_flags(dep: Step[Any], bucket: Bucket, index: int) -> ExecutionEntryFlags:
+    """Get the flags for a dependency at a given index."""
+    dep_id = dep.id
+    if dep_id in bucket.flags:
+        dep_flags = bucket.flags[dep_id]
+        if isinstance(dep_flags, list) and index < len(dep_flags):
+            return dep_flags[index]
+    # No explicit flags — check the stored value
+    if dep_id in bucket.store:
+        stored = bucket.store[dep_id]
+        if dep._is_unary or not isinstance(stored, list):
+            val = stored
+        elif index < len(stored):
+            val = stored[index]
+        else:
+            val = None
+        if is_flagged_value(val):
+            return val.flag
+        if val is None:
+            return FLAG_NULL
+    return NO_FLAGS
+
+
 def _execute_step(step: Step[Any], bucket: Bucket) -> None:
     """Execute a single step within a bucket."""
+    # Check if any dependency value is flagged and forbidden for this step.
+    # If so, propagate the flagged value instead of executing the step.
+    # This mirrors the TS behaviour where the bucket execution checks
+    # forbidden flags per-entry.
+    forbidden_flags_list = step._dependency_forbidden_flags
+
+    # For unary steps, check once
+    if step._is_unary:
+        for dep_idx, dep in enumerate(step.dependencies):
+            dep_id = dep.id
+            forbidden = forbidden_flags_list[dep_idx] if dep_idx < len(forbidden_flags_list) else DEFAULT_FORBIDDEN_FLAGS
+            dep_flags = _get_dep_flags(dep, bucket, 0)
+            disallowed = dep_flags & forbidden
+            if disallowed:
+                # This dependency has a forbidden flag — propagate it
+                if dep_id in bucket.store:
+                    stored = bucket.store[dep_id]
+                    if is_flagged_value(stored):
+                        bucket.store[step.id] = stored
+                        bucket.flags[step.id] = [stored.flag]
+                        return
+                # Null value that's forbidden — create a flagged null
+                fv = FlaggedValue(FLAG_NULL, None)
+                bucket.store[step.id] = fv
+                bucket.flags[step.id] = [FLAG_NULL]
+                return
+
+    # For batch steps, build a per-entry skip mask.
+    skip_mask: list[FlaggedValue | None] | None = None
+    if not step._is_unary and bucket.size > 0:
+        skip_mask = [None] * bucket.size
+        for dep_idx, dep in enumerate(step.dependencies):
+            dep_id = dep.id
+            forbidden = forbidden_flags_list[dep_idx] if dep_idx < len(forbidden_flags_list) else DEFAULT_FORBIDDEN_FLAGS
+
+            for j in range(bucket.size):
+                if skip_mask[j] is not None:
+                    continue
+                dep_flags = _get_dep_flags(dep, bucket, j)
+                disallowed = dep_flags & forbidden
+                if disallowed:
+                    # Get the actual value to propagate
+                    if dep_id in bucket.store:
+                        stored = bucket.store[dep_id]
+                        if dep._is_unary or not isinstance(stored, list):
+                            val = stored
+                        elif j < len(stored):
+                            val = stored[j]
+                        else:
+                            val = None
+                        if is_flagged_value(val):
+                            skip_mask[j] = val
+                        else:
+                            skip_mask[j] = FlaggedValue(dep_flags, val)
+                    else:
+                        skip_mask[j] = FlaggedValue(FLAG_NULL, None)
+
     # Build execution values for each dependency
     dep_values: list[ExecutionValue] = []
     for dep in step.dependencies:
@@ -86,6 +166,13 @@ def _execute_step(step: Step[Any], bucket: Bucket) -> None:
         flagged = FlaggedValue(FLAG_ERROR, e)
         results = [flagged] * bucket.size
 
+    # Apply skip mask: entries that were skipped due to forbidden flags
+    # get the propagated flagged value instead of the computed result.
+    if skip_mask is not None and isinstance(results, list):
+        for j in range(min(len(results), len(skip_mask))):
+            if skip_mask[j] is not None:
+                results[j] = skip_mask[j]
+
     # Store results
     if step._is_unary:
         # Unary step — store single value (not the list)
@@ -93,11 +180,13 @@ def _execute_step(step: Step[Any], bucket: Bucket) -> None:
     else:
         bucket.store[step.id] = results
 
-    # Track flags
+    # Track flags — set FLAG_NULL for None results (mirrors TS behavior)
     flags: list[ExecutionEntryFlags] = []
     for r in (results if isinstance(results, list) else [results]):
         if is_flagged_value(r):
             flags.append(r.flag)
+        elif r is None:
+            flags.append(FLAG_NULL)
         else:
             flags.append(NO_FLAGS)
     bucket.flags[step.id] = flags

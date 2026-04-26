@@ -202,13 +202,28 @@ def _execute_array_output(
     # use a sub-bucket to properly execute all dependent steps.
     if elem_output.mode in ("object", "polymorphic") and len(list_value) > 0:
         return _execute_array_elements_via_bucket(
-            output_plan, elem_output, step, list_value, bucket
+            output_plan, elem_output, step, list_value, bucket,
+            errors=errors, path=path,
         )
 
     # For each element, build its output
     result: list[Any] = []
-    for item in list_value:
-        if item is None or is_flagged_value(item):
+    for idx, item in enumerate(list_value):
+        if is_flagged_value(item):
+            _collect_error(item, errors, path + [idx])
+            result.append(None)
+        elif isinstance(item, Exception):
+            # Exceptions embedded in lists are treated as errors
+            if errors is not None:
+                from graphql import GraphQLError as _GQLError
+                if isinstance(item, _GQLError):
+                    # Preserve the original GraphQLError but add path
+                    errors.append(_GQLError(item.message, path=path + [idx]))
+                else:
+                    msg = str(item)
+                    errors.append(_GQLError(msg, path=path + [idx]))
+            result.append(None)
+        elif item is None:
             result.append(None)
         elif elem_output.mode == "leaf":
             if elem_output.serializer is not None:
@@ -291,6 +306,8 @@ def _execute_array_elements_via_bucket(
     array_step: Any,
     items: list | tuple,
     parent_bucket: Bucket,
+    errors: list[Any] | None = None,
+    path: list[str | int] | None = None,
 ) -> list[Any]:
     """Execute element-level steps in a sub-bucket so that polymorphic
     resolution, nested plan resolvers, and type-specific fields all work."""
@@ -366,13 +383,15 @@ def _execute_array_elements_via_bucket(
         sub_bucket._non_unary_overrides.add(s.id)
 
     # Now read out results using the element output plan.
+    if path is None:
+        path = []
     result: list[Any] = []
     for i in range(n):
         item = items[i]
         if item is None or is_flagged_value(item):
             result.append(None)
         else:
-            result.append(execute_output_plan(elem_output, sub_bucket, i))
+            result.append(execute_output_plan(elem_output, sub_bucket, i, errors, path + [i]))
     return result
 
 
