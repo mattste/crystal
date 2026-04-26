@@ -15,6 +15,7 @@ from pygrafast.steps.constant import constant
 from pygrafast.steps.context_step import context
 from pygrafast.steps.each import each
 from pygrafast.steps.get import get
+from pygrafast.steps.list_step import list_
 from pygrafast.steps.load_many import load_many
 from pygrafast.steps.load_one import load_one
 
@@ -331,8 +332,9 @@ def _coalesce_values(values: list[Any]) -> Any:
 def _loot_boxes_for_item(type_step: Any, id_step: Any) -> Any:
     """Given item type and id steps, load the loot boxes that can contain this item."""
     db = context().get("dccDb")
+    key_step = list_([type_step, id_step])
     loot_data = load_many(
-        [type_step, id_step],
+        key_step,
         {"load": batch_get_loot_data_by_item_type_and_id, "shared": db},
     )
     return each(loot_data, lambda loot_datum_step: load_one(
@@ -556,7 +558,36 @@ def make_base_args() -> dict[str, Any]:
                 },
             },
             "Item": {
-                "planType": lambda item_spec_step: _plan_item_type(item_spec_step),
+                "planType": lambda item_step: _plan_item_type(item_step),
+                "plans": {
+                    "canBeFoundIn": lambda source_step, _fa: _loot_boxes_for_item(
+                        get(source_step, "__typename"), get(source_step, "id"),
+                    ),
+                },
+            },
+            "HasContents": {
+                "plans": {
+                    "contents": lambda source_step, field_args: _resolve_item_spec_list_step(
+                        get(source_step, "contents"),
+                        field_args.get_raw("first"),
+                    ),
+                },
+            },
+            "Created": {
+                "plans": {
+                    "creator": lambda source_step, _fa: load_one(
+                        get(source_step, "creator"),
+                        {"load": batch_get_crawler_by_id, "shared": context().get("dccDb")},
+                    ),
+                },
+            },
+            "HasInventory": {
+                "plans": {
+                    "items": lambda source_step, field_args: _resolve_item_spec_list_step(
+                        get(source_step, "items"),
+                        field_args.get_raw("first"),
+                    ),
+                },
             },
             "Location": {
                 "planType": lambda location_step: _plan_location_type(location_step),
