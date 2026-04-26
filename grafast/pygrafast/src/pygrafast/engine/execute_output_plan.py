@@ -13,41 +13,68 @@ def execute_output_plan(
     output_plan: OutputPlan,
     bucket: Bucket,
     index: int = 0,
+    errors: list[Any] | None = None,
+    path: list[str | int] | None = None,
 ) -> Any:
     """Serialize a single entry from a bucket according to the output plan."""
+    if path is None:
+        path = []
     mode = output_plan.mode
 
     if mode == "root" or mode == "object":
-        return _execute_object_output(output_plan, bucket, index)
+        return _execute_object_output(output_plan, bucket, index, errors, path)
     elif mode == "leaf":
-        return _execute_leaf_output(output_plan, bucket, index)
+        return _execute_leaf_output(output_plan, bucket, index, errors, path)
     elif mode == "polymorphic":
-        return _execute_polymorphic_output(output_plan, bucket, index)
+        return _execute_polymorphic_output(output_plan, bucket, index, errors, path)
     elif mode == "array":
-        return _execute_array_output(output_plan, bucket, index)
+        return _execute_array_output(output_plan, bucket, index, errors, path)
     elif mode == "null":
         return None
     else:
         raise ValueError(f"Unsupported output mode: {mode}")
 
 
+def _collect_error(
+    flagged: FlaggedValue,
+    errors: list[Any] | None,
+    path: list[str | int],
+) -> None:
+    """If the flagged value carries an error, add it to the errors list."""
+    if errors is None:
+        return
+    from ..constants import FLAG_ERROR
+    if flagged.flag & FLAG_ERROR:
+        from graphql import GraphQLError
+        original = flagged.value
+        msg = str(original) if original is not None else "Unknown error"
+        errors.append(GraphQLError(msg, path=list(path)))
+
+
 def _execute_object_output(
     output_plan: OutputPlan,
     bucket: Bucket,
     index: int,
+    errors: list[Any] | None = None,
+    path: list[str | int] | None = None,
 ) -> dict[str, Any] | None:
     """Build an object result from the output plan's children."""
+    if path is None:
+        path = []
     # If the object's own root step returned null, the whole object is null
     if output_plan.root_step is not None:
         obj_value = _get_step_value(output_plan.root_step, bucket, index)
-        if obj_value is None or is_flagged_value(obj_value):
+        if is_flagged_value(obj_value):
+            _collect_error(obj_value, errors, path)
+            return None
+        if obj_value is None:
             return None
 
     result: dict[str, Any] = {}
 
     for key in output_plan.keys:
         child_output, child_step = output_plan.children[key]
-        result[key] = execute_output_plan(child_output, bucket, index)
+        result[key] = execute_output_plan(child_output, bucket, index, errors, path + [key])
 
     return result
 
@@ -56,12 +83,19 @@ def _execute_polymorphic_output(
     output_plan: OutputPlan,
     bucket: Bucket,
     index: int,
+    errors: list[Any] | None = None,
+    path: list[str | int] | None = None,
 ) -> dict[str, Any] | None:
     """Build a polymorphic object result, selecting fields based on __typename."""
+    if path is None:
+        path = []
     # Check if the root step value is null
     if output_plan.root_step is not None:
         obj_value = _get_step_value(output_plan.root_step, bucket, index)
-        if obj_value is None or is_flagged_value(obj_value):
+        if is_flagged_value(obj_value):
+            _collect_error(obj_value, errors, path)
+            return None
+        if obj_value is None:
             return None
 
     # Resolve __typename
@@ -84,7 +118,7 @@ def _execute_polymorphic_output(
         if key == "__typename":
             result["__typename"] = typename
         else:
-            result[key] = execute_output_plan(child_output, bucket, index)
+            result[key] = execute_output_plan(child_output, bucket, index, errors, path + [key])
 
     # Determine which type_keys entries apply to this typename.
     # This includes the concrete type itself AND any interfaces/abstract
@@ -102,7 +136,7 @@ def _execute_polymorphic_output(
             for key in type_keys:
                 if key not in result and key in type_children:
                     child_output, child_step = type_children[key]
-                    result[key] = execute_output_plan(child_output, bucket, index)
+                    result[key] = execute_output_plan(child_output, bucket, index, errors, path + [key])
 
     return result
 
@@ -138,15 +172,22 @@ def _execute_array_output(
     output_plan: OutputPlan,
     bucket: Bucket,
     index: int,
+    errors: list[Any] | None = None,
+    path: list[str | int] | None = None,
 ) -> list[Any] | None:
     """Build an array result from the output plan."""
+    if path is None:
+        path = []
     step = output_plan.root_step
     if step is None:
         return None
 
     list_value = _get_step_value(step, bucket, index)
 
-    if list_value is None or is_flagged_value(list_value):
+    if is_flagged_value(list_value):
+        _collect_error(list_value, errors, path)
+        return None
+    if list_value is None:
         return None
 
     if not isinstance(list_value, (list, tuple)):
@@ -410,8 +451,12 @@ def _execute_leaf_output(
     output_plan: OutputPlan,
     bucket: Bucket,
     index: int,
+    errors: list[Any] | None = None,
+    path: list[str | int] | None = None,
 ) -> Any:
     """Get a leaf value, applying serialization if needed."""
+    if path is None:
+        path = []
     step = output_plan.root_step
     if step is None:
         return None
@@ -419,6 +464,7 @@ def _execute_leaf_output(
     value = _get_step_value(step, bucket, index)
 
     if is_flagged_value(value):
+        _collect_error(value, errors, path)
         return None
 
     if value is None:

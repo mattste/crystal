@@ -93,12 +93,13 @@ async def grafast(
     if op_plan._output_plan is None:
         return GrafastResult(data=None)
 
+    errors: list[Any] = []
     try:
-        data = execute_output_plan(op_plan._output_plan, bucket, index=0)
+        data = execute_output_plan(op_plan._output_plan, bucket, index=0, errors=errors)
     except Exception as e:
         return GrafastResult(errors=[e])
 
-    return GrafastResult(data=data)
+    return GrafastResult(data=data, errors=errors if errors else None)
 
 
 def _find_operation(

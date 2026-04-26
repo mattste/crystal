@@ -17,6 +17,7 @@ from pygrafast.steps.each import each
 from pygrafast.steps.get import get
 from pygrafast.steps.list_step import list_
 from pygrafast.steps.load_many import load_many
+from pygrafast.steps.connection import connection
 from pygrafast.steps.load_one import load_one
 
 from .dcc_data import (
@@ -59,6 +60,13 @@ TYPE_DEFS = """
 
     interface HasInventory {
         items(first: Int): [Item]
+        itemsConnection(
+          first: Int
+          after: String
+          offset: Int
+          last: Int
+          before: String
+        ): ItemConnection
     }
 
     type Guide implements NPC & Character {
@@ -74,6 +82,13 @@ TYPE_DEFS = """
         name: String!
         species: Species
         items(first: Int): [Item]
+        itemsConnection(
+          first: Int
+          after: String
+          offset: Int
+          last: Int
+          before: String
+        ): ItemConnection
         exCrawler: Boolean
         friends(first: Int): [Character]
         bestFriend: Character
@@ -96,6 +111,13 @@ TYPE_DEFS = """
         bestFriend: Character
         friends(first: Int): [Character]
         items(first: Int): [Item]
+        itemsConnection(
+          first: Int
+          after: String
+          offset: Int
+          last: Int
+          before: String
+        ): ItemConnection
     }
 
     interface NPC implements Character {
@@ -125,10 +147,49 @@ TYPE_DEFS = """
         name: String!
         species: Species
         items(first: Int): [Item]
+        itemsConnection(
+          first: Int
+          after: String
+          offset: Int
+          last: Int
+          before: String
+        ): ItemConnection
         favouriteItem: Item
         friends(first: Int): [Character]
+        friendsConnection(
+          first: Int
+          after: String
+          offset: Int
+          last: Int
+          before: String
+        ): CharacterConnection
         bestFriend: ActiveCrawler
         crawlerNumber: Int
+    }
+
+    type ItemConnection {
+        edges: [ItemEdge]
+        nodes: [Item]
+        pageInfo: PageInfo!
+    }
+    type ItemEdge {
+        node: Item
+        cursor: String!
+    }
+    type CharacterConnection {
+        edges: [CharacterEdge]
+        nodes: [Character]
+        pageInfo: PageInfo!
+    }
+    type CharacterEdge {
+        node: Character
+        cursor: String!
+    }
+    type PageInfo {
+        hasNextPage: Boolean!
+        hasPreviousPage: Boolean!
+        startCursor: String
+        endCursor: String
     }
 
     interface Item {
@@ -409,6 +470,39 @@ def _resolve_item_spec_list_step(spec_list_step: Any, first_step: Any = None) ->
     return each(limited, _resolve_item_spec_step)
 
 
+def _plan_active_crawler_friends_connection(crawler_step: Any, field_args: Any) -> Any:
+    """Plan ActiveCrawler.friendsConnection - paginated friends list."""
+    crawler_id = get(crawler_step, "id")
+    db_step = context().get("dccDb")
+    friend_ids = load_many(
+        crawler_id,
+        {"load": batch_get_friend_ids_by_crawler_id, "shared": db_step},
+    )
+
+    def resolve_friend(friend_id_step: Any) -> Any:
+        """Resolve a single friend ID to a Character object."""
+        db = context().get("dccDb")
+        crawler_id = lambda_(friend_id_step, _extract_crawler_id)
+        crawler = load_one(
+            crawler_id,
+            {"load": batch_get_crawler_by_id, "shared": db},
+        )
+        npc_id = lambda_(friend_id_step, _extract_npc_id)
+        npc = load_one(
+            npc_id,
+            {"load": batch_get_npc_by_id, "shared": db},
+        )
+        return lambda_([crawler, npc], _coalesce_values)
+
+    return connection(friend_ids, field_args, node_callback=resolve_friend)
+
+
+def _plan_items_connection(source_step: Any, field_args: Any) -> Any:
+    """Plan itemsConnection - paginated items list for HasInventory types."""
+    items_step = get(source_step, "items")
+    return connection(items_step, field_args, node_callback=_resolve_item_spec_step)
+
+
 def _plan_location_floors(place_step: Any, _fa: Any) -> Any:
     """Plan Location.floors - maps floor numbers to Floor objects.
 
@@ -458,10 +552,12 @@ def make_base_args() -> dict[str, Any]:
                         {"load": batch_get_crawler_by_id, "shared": context().get("dccDb")},
                     ),
                     "friends": _plan_active_crawler_friends,
+                    "friendsConnection": _plan_active_crawler_friends_connection,
                     "items": lambda crawler_step, field_args: _resolve_item_spec_list_step(
                         get(crawler_step, "items"),
                         field_args.get_raw("first"),
                     ),
+                    "itemsConnection": _plan_items_connection,
                     "favouriteItem": lambda crawler_step, _fa: _resolve_item_spec_step(
                         get(crawler_step, "favouriteItem"),
                     ),
@@ -479,6 +575,7 @@ def make_base_args() -> dict[str, Any]:
                         get(npc_step, "items"),
                         field_args.get_raw("first"),
                     ),
+                    "itemsConnection": _plan_items_connection,
                 },
             },
             "Security": {
@@ -508,6 +605,7 @@ def make_base_args() -> dict[str, Any]:
                         get(npc_step, "items"),
                         field_args.get_raw("first"),
                     ),
+                    "itemsConnection": _plan_items_connection,
                 },
             },
             "Floor": {
@@ -655,6 +753,7 @@ def make_base_args() -> dict[str, Any]:
                         get(source_step, "items"),
                         field_args.get_raw("first"),
                     ),
+                    "itemsConnection": _plan_items_connection,
                 },
             },
             "Location": {
