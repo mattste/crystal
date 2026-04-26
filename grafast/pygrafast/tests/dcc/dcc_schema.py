@@ -20,6 +20,7 @@ from pygrafast.steps.load_many import load_many
 from pygrafast.steps.load_one import load_one
 
 from .dcc_data import (
+    batch_get_beta_location_by_id,
     batch_get_club_by_id,
     batch_get_consumable_by_id,
     batch_get_crawler_by_id,
@@ -321,6 +322,23 @@ def _get_floor(number: int) -> dict[str, int] | None:
     return None
 
 
+def _merge_location_data(args: list[Any]) -> Any:
+    """Merge type-specific data with shared location data (delegate pattern).
+
+    The type-specific object (e.g. SafeRoom, Club) gets type/name/floors/id
+    from the location object.
+    """
+    location, type_specific = args
+    if type_specific is None:
+        return None
+    merged = dict(type_specific)
+    if location:
+        for key in ("type", "name", "floors", "id"):
+            if key in location:
+                merged[key] = location[key]
+    return merged
+
+
 def _coalesce_values(values: list[Any]) -> Any:
     """Return first non-None value."""
     for v in values:
@@ -389,6 +407,15 @@ def _resolve_item_spec_list_step(spec_list_step: Any, first_step: Any = None) ->
     else:
         limited = spec_list_step
     return each(limited, _resolve_item_spec_step)
+
+
+def _plan_location_floors(place_step: Any, _fa: Any) -> Any:
+    """Plan Location.floors - maps floor numbers to Floor objects.
+
+    Corresponds to TS SharedLocationResolvers.floors.
+    """
+    floors_step = get(place_step, "floors")
+    return each(floors_step, lambda floor_num_step: lambda_(floor_num_step, _get_floor))
 
 
 def make_base_args() -> dict[str, Any]:
@@ -491,6 +518,47 @@ def make_base_args() -> dict[str, Any]:
                     ),
                 },
             },
+            "SafeRoom": {
+                "plans": {
+                    "floors": _plan_location_floors,
+                    "manager": lambda sr_step, _fa: load_one(
+                        get(sr_step, "manager"),
+                        {"load": batch_get_npc_by_id, "shared": context().get("dccDb")},
+                    ),
+                    "stock": lambda sr_step, _fa: _resolve_item_spec_list_step(
+                        get(sr_step, "stock"),
+                    ),
+                },
+            },
+            "Club": {
+                "plans": {
+                    "floors": _plan_location_floors,
+                    "manager": lambda club_step, _fa: load_one(
+                        get(club_step, "manager"),
+                        {"load": batch_get_npc_by_id, "shared": context().get("dccDb")},
+                    ),
+                    "security": lambda club_step, _fa: each(
+                        get(club_step, "security"),
+                        lambda id_step: load_one(
+                            id_step,
+                            {"load": batch_get_npc_by_id, "shared": context().get("dccDb")},
+                        ),
+                    ),
+                    "stock": lambda club_step, _fa: _resolve_item_spec_list_step(
+                        get(club_step, "stock"),
+                    ),
+                },
+            },
+            "Stairwell": {
+                "plans": {
+                    "floors": _plan_location_floors,
+                },
+            },
+            "BetaLocation": {
+                "plans": {
+                    "floors": _plan_location_floors,
+                },
+            },
             "Equipment": {
                 "plans": {
                     "creator": lambda source_step, _fa: load_one(
@@ -591,6 +659,9 @@ def make_base_args() -> dict[str, Any]:
             },
             "Location": {
                 "planType": lambda location_step: _plan_location_type(location_step),
+                "plans": {
+                    "floors": _plan_location_floors,
+                },
             },
         },
         unions={
@@ -756,6 +827,37 @@ def _plan_item_type(item_step: Any) -> dict[str, Any]:
 
 
 def _plan_location_type(location_step: Any) -> dict[str, Any]:
-    """Plan Location interface resolution."""
+    """Plan Location interface resolution.
+
+    Returns $__typename and planForType which loads type-specific data
+    (SafeRoom, Club, Stairwell) and merges it with the shared location fields.
+    """
+    db = context().get("dccDb")
     typename_step = get(location_step, "type")
-    return {"$__typename": typename_step}
+    id_step = get(location_step, "id")
+
+    def plan_for_type(t: Any) -> Any:
+        if t.name == "SafeRoom":
+            saferoom = load_one(
+                id_step,
+                {"load": batch_get_safe_room_by_id, "shared": db},
+            )
+            return lambda_([location_step, saferoom], _merge_location_data)
+        if t.name == "Club":
+            club = load_one(
+                id_step,
+                {"load": batch_get_club_by_id, "shared": db},
+            )
+            return lambda_([location_step, club], _merge_location_data)
+        if t.name == "Stairwell":
+            stairwell = load_one(
+                id_step,
+                {"load": batch_get_stairwell_by_id, "shared": db},
+            )
+            return lambda_([location_step, stairwell], _merge_location_data)
+        if t.name == "BetaLocation":
+            # Explicitly return None — BetaLocation data is intentionally null
+            return None
+        return None
+
+    return {"$__typename": typename_step, "planForType": plan_for_type}

@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, Any, Callable
 from graphql import (
     DocumentNode,
     FieldNode,
+    FragmentDefinitionNode,
+    FragmentSpreadNode,
     GraphQLEnumType,
     GraphQLField,
     GraphQLInterfaceType,
@@ -100,6 +102,12 @@ class OperationPlan:
         self._layer_plans: list[LayerPlan] = []
         self._output_plan: OutputPlan | None = None
 
+        # Build fragment map from document definitions
+        self._fragments: dict[str, FragmentDefinitionNode] = {}
+        for defn in document.definitions:
+            if isinstance(defn, FragmentDefinitionNode):
+                self._fragments[defn.name.value] = defn
+
         # Create root layer plan
         self.root_layer_plan = LayerPlan(self, LayerPlanReasonRoot())
 
@@ -179,6 +187,22 @@ class OperationPlan:
                         output_plan,
                         layer_plan,
                     )
+                elif isinstance(field_type, GraphQLUnionType):
+                    # Union types only support __typename as a direct field
+                    if selection.name.value == "__typename":
+                        # Handle __typename for union types in polymorphic context
+                        response_key = (
+                            selection.alias.value if selection.alias else "__typename"
+                        )
+                        if (output_plan.mode == "polymorphic"
+                                and output_plan.typename_step is not None):
+                            child_output = OutputPlan(layer_plan, mode="leaf")
+                            child_output.root_step = output_plan.typename_step
+                            output_plan.children[response_key] = (
+                                child_output, output_plan.typename_step
+                            )
+                            if response_key not in output_plan.keys:
+                                output_plan.keys.append(response_key)
             elif isinstance(selection, InlineFragmentNode):
                 self._plan_inline_fragment(
                     selection,
@@ -187,6 +211,23 @@ class OperationPlan:
                     output_plan,
                     layer_plan,
                 )
+            elif isinstance(selection, FragmentSpreadNode):
+                frag_name = selection.name.value
+                frag_def = self._fragments.get(frag_name)
+                if frag_def is not None:
+                    # Create a synthetic InlineFragmentNode from the fragment
+                    # and process it the same way
+                    synthetic = InlineFragmentNode(
+                        type_condition=frag_def.type_condition,
+                        selection_set=frag_def.selection_set,
+                    )
+                    self._plan_inline_fragment(
+                        synthetic,
+                        parent_type,
+                        parent_step,
+                        output_plan,
+                        layer_plan,
+                    )
 
     def _plan_inline_fragment(
         self,
@@ -228,7 +269,8 @@ class OperationPlan:
             effective_parent = parent_step
             if (output_plan.plan_for_type is not None
                     and isinstance(target_type, GraphQLObjectType)
-                    and type_name not in output_plan.type_steps):
+                    and type_name not in output_plan.type_steps
+                    and type_name not in output_plan.null_types):
                 plan_for_type_fn = output_plan.plan_for_type
 
                 def call_plan_for_type(
@@ -243,6 +285,10 @@ class OperationPlan:
                 if type_step is not None:
                     output_plan.type_steps[type_name] = type_step
                     effective_parent = type_step
+                else:
+                    # planForType explicitly returned None — this type should
+                    # render as null during execution.
+                    output_plan.null_types.add(type_name)
 
             if type_name in output_plan.type_steps:
                 effective_parent = output_plan.type_steps[type_name]
@@ -425,6 +471,12 @@ class OperationPlan:
                         elem_output,
                         layer_plan,
                     )
+                # Eagerly evaluate planForType for all possible concrete types
+                # so that types returning None are recorded in null_types.
+                if elem_output.plan_for_type is not None:
+                    self._eager_plan_for_type(
+                        unwrapped_type, elem_output, layer_plan
+                    )
             else:
                 elem_output = OutputPlan(layer_plan, mode="leaf")
 
@@ -480,6 +532,11 @@ class OperationPlan:
                     result_step,
                     child_output,
                     layer_plan,
+                )
+            # Eagerly evaluate planForType for all possible concrete types
+            if child_output.plan_for_type is not None:
+                self._eager_plan_for_type(
+                    unwrapped_type, child_output, layer_plan
                 )
         else:
             # Fallback: treat as leaf
@@ -582,6 +639,40 @@ class OperationPlan:
         if extensions and GRAFAST_PLAN_TYPE_KEY in extensions:
             return extensions[GRAFAST_PLAN_TYPE_KEY]
         return None
+
+    def _eager_plan_for_type(
+        self,
+        abstract_type: GraphQLInterfaceType | GraphQLUnionType,
+        output_plan: OutputPlan,
+        layer_plan: LayerPlan,
+    ) -> None:
+        """Eagerly call planForType for all possible concrete types of an
+        abstract type.  This ensures types that return None are recorded in
+        null_types so they render as null during execution."""
+        if output_plan.plan_for_type is None:
+            return
+
+        possible_types = self.schema.get_possible_types(abstract_type) or []
+        for concrete_type in possible_types:
+            type_name = concrete_type.name
+            if type_name in output_plan.type_steps or type_name in output_plan.null_types:
+                continue  # Already evaluated
+
+            plan_for_type_fn = output_plan.plan_for_type
+
+            def call_plan_for_type(
+                t: Any = concrete_type,
+                fn: Any = plan_for_type_fn,
+            ) -> Step[Any] | None:
+                return fn(t)
+
+            type_step = with_global_layer_plan(
+                layer_plan, None, call_plan_for_type
+            )
+            if type_step is not None:
+                output_plan.type_steps[type_name] = type_step
+            else:
+                output_plan.null_types.add(type_name)
 
     def _finalize(self) -> None:
         """Finalize the plan — build execution phases."""

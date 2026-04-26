@@ -72,6 +72,10 @@ def _execute_polymorphic_output(
     if typename is None:
         return None
 
+    # If planForType explicitly returned None for this type, render as null
+    if typename in output_plan.null_types:
+        return None
+
     result: dict[str, Any] = {}
 
     # First, add common fields (fields defined on the interface itself)

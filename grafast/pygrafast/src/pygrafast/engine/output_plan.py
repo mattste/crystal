@@ -46,5 +46,8 @@ class OutputPlan:
         # These come from planForType and hold the loaded data for each concrete type
         self.type_steps: dict[str, Step[Any]] = {}
 
+        # Types for which planForType explicitly returned None (should render as null)
+        self.null_types: set[str] = set()
+
         # For array mode: the output plan for each element
         self.element_output: OutputPlan | None = None
