@@ -24,7 +24,7 @@ from graphql import (
     is_abstract_type,
     is_leaf_type,
 )
-from graphql.language import OperationType
+from graphql.language import DirectiveNode, OperationType, VariableNode
 from graphql.utilities import value_from_ast
 
 from ..constants import UNDEFINED
@@ -165,6 +165,53 @@ class OperationPlan:
             self.root_layer_plan,
         )
 
+    def _should_include_selection(
+        self,
+        directives: tuple[DirectiveNode, ...] | None,
+    ) -> bool:
+        """Check @include and @skip directives to determine if a selection
+        should be included at plan time.
+
+        Returns True if the selection should be included, False if it should
+        be skipped.  Only evaluates directives whose argument is a literal
+        value or a variable whose value is known at plan time.
+        """
+        if not directives:
+            return True
+
+        for directive in directives:
+            name = directive.name.value
+            if name not in ("include", "skip"):
+                continue
+
+            # Get the 'if' argument
+            if_value: bool | None = None
+            for arg in directive.arguments:
+                if arg.name.value == "if":
+                    arg_val = arg.value
+                    if isinstance(arg_val, VariableNode):
+                        var_name = arg_val.name.value
+                        var_val = self.variable_values.get(var_name, UNDEFINED)
+                        if var_val is not UNDEFINED:
+                            if_value = bool(var_val)
+                    else:
+                        # Literal boolean
+                        from graphql.language import BooleanValueNode
+                        if isinstance(arg_val, BooleanValueNode):
+                            if_value = arg_val.value
+                    break
+
+            if if_value is None:
+                # Could not resolve — include by default
+                continue
+
+            if name == "include" and not if_value:
+                return False
+            if name == "skip" and if_value:
+                return False
+
+        return True
+
     def _plan_selection_set(
         self,
         selection_set: SelectionSetNode,
@@ -176,6 +223,8 @@ class OperationPlan:
     ) -> None:
         """Plan each field in a selection set."""
         for selection in selection_set.selections:
+            if not self._should_include_selection(selection.directives):
+                continue
             if isinstance(selection, FieldNode):
                 # Use the concrete type for field lookup if available
                 field_type = concrete_type or parent_type
@@ -315,7 +364,15 @@ class OperationPlan:
         else:
             # Non-polymorphic context — just plan the fields
             if fragment.selection_set:
-                concrete = target_type if isinstance(target_type, GraphQLObjectType) else None
+                if isinstance(target_type, GraphQLObjectType):
+                    concrete = target_type
+                elif isinstance(parent_type, GraphQLObjectType):
+                    # The fragment targets an abstract type (interface) but we
+                    # are inside a concrete object type that implements it.
+                    # Use the concrete parent so field plan resolvers are found.
+                    concrete = parent_type
+                else:
+                    concrete = None
                 self._plan_selection_set(
                     fragment.selection_set,
                     target_type,
