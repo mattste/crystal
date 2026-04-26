@@ -278,7 +278,9 @@ def _extract_npc_id(id_val: int) -> int | None:
     return None
 
 
-def _decode_item_spec(item_spec: str) -> dict[str, Any]:
+def _decode_item_spec(item_spec: str | None) -> dict[str, Any] | None:
+    if item_spec is None:
+        return None
     typename, raw_id = item_spec.split(":")
     return {"__typename": typename, "id": int(raw_id)}
 
@@ -286,6 +288,30 @@ def _decode_item_spec(item_spec: str) -> dict[str, Any]:
 def _encode_item_spec(args: list[Any]) -> str:
     type_name, id_val = args
     return f"{type_name}:{id_val}"
+
+
+def _load_item_by_decoded(args: list[Any]) -> dict[str, Any] | None:
+    """Given [decoded_spec, equipment, consumable, utility_item, misc_item],
+    select the correct loaded item based on __typename and add __typename to it."""
+    decoded, equipment, consumable, utility_item, misc_item = args
+    if decoded is None:
+        return None
+    typename = decoded.get("__typename")
+    data = None
+    if typename == "Equipment":
+        data = equipment
+    elif typename == "Consumable":
+        data = consumable
+    elif typename == "UtilityItem":
+        data = utility_item
+    elif typename == "MiscItem":
+        data = misc_item
+    if data is None:
+        return None
+    # Return a copy with __typename added
+    result = dict(data)
+    result["__typename"] = typename
+    return result
 
 
 def _get_floor(number: int) -> dict[str, int] | None:
@@ -300,6 +326,67 @@ def _coalesce_values(values: list[Any]) -> Any:
         if v is not None:
             return v
     return None
+
+
+def _loot_boxes_for_item(type_step: Any, id_step: Any) -> Any:
+    """Given item type and id steps, load the loot boxes that can contain this item."""
+    db = context().get("dccDb")
+    loot_data = load_many(
+        [type_step, id_step],
+        {"load": batch_get_loot_data_by_item_type_and_id, "shared": db},
+    )
+    return each(loot_data, lambda loot_datum_step: load_one(
+        get(loot_datum_step, "lootBoxId"),
+        {"load": batch_get_loot_box_by_id, "shared": context().get("dccDb")},
+    ))
+
+
+def _plan_loot_box_possible_items(loot_box_step: Any, _fa: Any) -> Any:
+    """Load the possible items for a loot box."""
+    db = context().get("dccDb")
+    loot_data = load_many(
+        get(loot_box_step, "id"),
+        {"load": batch_get_loot_data_by_loot_box_id, "shared": db},
+    )
+    return each(loot_data, lambda loot_datum_step: _resolve_item_spec_step(
+        lambda_(
+            [get(loot_datum_step, "itemType"), get(loot_datum_step, "itemId")],
+            _encode_item_spec,
+        ),
+    ))
+
+
+def _resolve_item_spec_step(item_spec_step: Any) -> Any:
+    """Given a step producing an item spec string (e.g. "Equipment:201"),
+    return a step producing a loaded item dict with __typename.
+
+    This performs:
+      1. Decode the spec to get {__typename, id}
+      2. Load from all four item tables using the id
+      3. Select the correct one based on __typename
+    """
+    db = context().get("dccDb")
+    decoded = lambda_(item_spec_step, _decode_item_spec)
+    id_step = get(decoded, "id")
+
+    equipment = load_one(id_step, {"load": batch_get_equipment_by_id, "shared": db})
+    consumable = load_one(id_step, {"load": batch_get_consumable_by_id, "shared": db})
+    utility_item = load_one(id_step, {"load": batch_get_utility_item_by_id, "shared": db})
+    misc_item = load_one(id_step, {"load": batch_get_misc_item_by_id, "shared": db})
+
+    return lambda_(
+        [decoded, equipment, consumable, utility_item, misc_item],
+        _load_item_by_decoded,
+    )
+
+
+def _resolve_item_spec_list_step(spec_list_step: Any, first_step: Any = None) -> Any:
+    """Resolve a list of item spec strings, with optional limit."""
+    if first_step is not None:
+        limited = lambda_([spec_list_step, first_step], _apply_limit)
+    else:
+        limited = spec_list_step
+    return each(limited, _resolve_item_spec_step)
 
 
 def make_base_args() -> dict[str, Any]:
@@ -324,10 +411,14 @@ def make_base_args() -> dict[str, Any]:
                         field_args.get_raw("id"),
                         {"load": batch_get_npc_by_id, "shared": context().get("dccDb")},
                     ),
-                    "brokenItem": lambda _parent, _field_args: constant("Utility:999"),
-                    "item": lambda _parent, field_args: lambda_(
-                        [field_args.get_raw("type"), field_args.get_raw("id")],
-                        lambda args: f"{args[0]}:{args[1]}",
+                    "brokenItem": lambda _parent, _field_args: _resolve_item_spec_step(
+                        constant("Utility:999"),
+                    ),
+                    "item": lambda _parent, field_args: _resolve_item_spec_step(
+                        lambda_(
+                            [field_args.get_raw("type"), field_args.get_raw("id")],
+                            lambda args: f"{args[0]}:{args[1]}",
+                        ),
                     ),
                 },
             },
@@ -338,11 +429,13 @@ def make_base_args() -> dict[str, Any]:
                         {"load": batch_get_crawler_by_id, "shared": context().get("dccDb")},
                     ),
                     "friends": _plan_active_crawler_friends,
-                    "items": lambda crawler_step, field_args: lambda_(
-                        [get(crawler_step, "items"), field_args.get_raw("first")],
-                        _apply_limit,
+                    "items": lambda crawler_step, field_args: _resolve_item_spec_list_step(
+                        get(crawler_step, "items"),
+                        field_args.get_raw("first"),
                     ),
-                    "favouriteItem": lambda crawler_step, _fa: get(crawler_step, "favouriteItem"),
+                    "favouriteItem": lambda crawler_step, _fa: _resolve_item_spec_step(
+                        get(crawler_step, "favouriteItem"),
+                    ),
                 },
             },
             "Manager": {
@@ -353,9 +446,9 @@ def make_base_args() -> dict[str, Any]:
                         get(manager_step, "client"),
                         {"load": batch_get_crawler_by_id, "shared": context().get("dccDb")},
                     ),
-                    "items": lambda npc_step, field_args: lambda_(
-                        [get(npc_step, "items"), field_args.get_raw("first")],
-                        _apply_limit,
+                    "items": lambda npc_step, field_args: _resolve_item_spec_list_step(
+                        get(npc_step, "items"),
+                        field_args.get_raw("first"),
                     ),
                 },
             },
@@ -382,9 +475,9 @@ def make_base_args() -> dict[str, Any]:
                 "plans": {
                     "friends": _plan_npc_friends,
                     "bestFriend": lambda npc_step, _fa: get(npc_step, "bestFriend"),
-                    "items": lambda npc_step, field_args: lambda_(
-                        [get(npc_step, "items"), field_args.get_raw("first")],
-                        _apply_limit,
+                    "items": lambda npc_step, field_args: _resolve_item_spec_list_step(
+                        get(npc_step, "items"),
+                        field_args.get_raw("first"),
                     ),
                 },
             },
@@ -402,6 +495,13 @@ def make_base_args() -> dict[str, Any]:
                         get(source_step, "creator"),
                         {"load": batch_get_crawler_by_id, "shared": context().get("dccDb")},
                     ),
+                    "canBeFoundIn": lambda source_step, _fa: _loot_boxes_for_item(
+                        constant("Equipment"), get(source_step, "id"),
+                    ),
+                    "contents": lambda source_step, field_args: _resolve_item_spec_list_step(
+                        get(source_step, "contents"),
+                        field_args.get_raw("first"),
+                    ),
                 },
             },
             "Consumable": {
@@ -410,6 +510,32 @@ def make_base_args() -> dict[str, Any]:
                         get(source_step, "creator"),
                         {"load": batch_get_crawler_by_id, "shared": context().get("dccDb")},
                     ),
+                    "canBeFoundIn": lambda source_step, _fa: _loot_boxes_for_item(
+                        constant("Consumable"), get(source_step, "id"),
+                    ),
+                    "contents": lambda source_step, field_args: _resolve_item_spec_list_step(
+                        get(source_step, "contents"),
+                        field_args.get_raw("first"),
+                    ),
+                },
+            },
+            "UtilityItem": {
+                "plans": {
+                    "canBeFoundIn": lambda source_step, _fa: _loot_boxes_for_item(
+                        constant("UtilityItem"), get(source_step, "id"),
+                    ),
+                },
+            },
+            "MiscItem": {
+                "plans": {
+                    "canBeFoundIn": lambda source_step, _fa: _loot_boxes_for_item(
+                        constant("MiscItem"), get(source_step, "id"),
+                    ),
+                },
+            },
+            "LootBox": {
+                "plans": {
+                    "possibleItems": _plan_loot_box_possible_items,
                 },
             },
         },
@@ -588,10 +714,13 @@ def _plan_npc_type(npc_step: Any) -> dict[str, Any]:
     return {"$__typename": typename_step}
 
 
-def _plan_item_type(item_spec_step: Any) -> dict[str, Any]:
-    """Plan Item interface/union resolution."""
-    decoded_step = lambda_(item_spec_step, _decode_item_spec)
-    typename_step = get(decoded_step, "__typename")
+def _plan_item_type(item_step: Any) -> dict[str, Any]:
+    """Plan Item interface/union resolution.
+
+    item_step now produces a loaded item dict with __typename,
+    so we just read __typename from it.
+    """
+    typename_step = get(item_step, "__typename")
     return {"$__typename": typename_step}
 
 
