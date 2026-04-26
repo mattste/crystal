@@ -424,6 +424,10 @@ def make_base_args() -> dict[str, Any]:
             },
             "NPC": {
                 "planType": lambda npc_id_step: _plan_npc_type(npc_id_step),
+                "plans": {
+                    "friends": _plan_npc_friends,
+                    "bestFriend": lambda npc_step, _fa: get(npc_step, "bestFriend"),
+                },
             },
             "Item": {
                 "planType": lambda item_spec_step: _plan_item_type(item_spec_step),
@@ -552,14 +556,15 @@ def _character_to_type_name(obj: Any) -> str | None:
     if obj is None:
         return None
     if isinstance(obj, dict):
-        # Check if it's a crawler
-        if "species" in obj and "deleted" not in obj or (isinstance(obj.get("deleted"), bool) and not obj["deleted"]):
-            return "ActiveCrawler"
-        if obj.get("deleted"):
-            return "DeletedCrawler"
-        # Check if it's an NPC
+        # Check if it's an NPC first (NPCs have a "type" field, crawlers don't)
         if "type" in obj:
             return _npc_to_type_name(obj)
+        # Check if it's a crawler
+        if obj.get("deleted"):
+            return "DeletedCrawler"
+        # Active crawler (has an id in the crawler range, or has species without type)
+        if "id" in obj:
+            return "ActiveCrawler"
     return None
 
 

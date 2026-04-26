@@ -96,7 +96,7 @@ def _apply_abstract_type_plans(
     schema: GraphQLSchema,
     type_configs: dict[str, Any],
 ) -> None:
-    """Apply planType from interface/union configs to schema types."""
+    """Apply planType and optional field plans from interface/union configs."""
     type_map = schema.type_map
 
     for type_name, type_config in type_configs.items():
@@ -104,14 +104,33 @@ def _apply_abstract_type_plans(
         if gql_type is None:
             continue
 
-        plan_type_fn = None
-        if isinstance(type_config, dict):
-            plan_type_fn = type_config.get("planType")
+        if not isinstance(type_config, dict):
+            continue
+
+        plan_type_fn = type_config.get("planType")
 
         if plan_type_fn is not None:
             ext = dict(gql_type.extensions) if gql_type.extensions else {}
             ext[GRAFAST_PLAN_TYPE_KEY] = plan_type_fn
             object.__setattr__(gql_type, "extensions", ext)
+
+        # Also apply field-level plan resolvers if provided
+        plans = type_config.get("plans")
+        if plans and hasattr(gql_type, "fields"):
+            fields = gql_type.fields  # type: ignore
+            for field_name, plan_resolver in plans.items():
+                if field_name not in fields:
+                    continue
+                field = fields[field_name]
+                if callable(plan_resolver):
+                    resolver_fn = plan_resolver
+                elif isinstance(plan_resolver, dict) and "plan" in plan_resolver:
+                    resolver_fn = plan_resolver["plan"]
+                else:
+                    continue
+                ext = dict(field.extensions) if field.extensions else {}
+                ext[GRAFAST_PLAN_RESOLVER_KEY] = resolver_fn
+                object.__setattr__(field, "extensions", ext)
 
 
 def _apply_enum_plans(

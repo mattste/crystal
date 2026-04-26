@@ -13,7 +13,7 @@ from .layer_plan import LayerPlan
 class Bucket:
     """Runtime container holding results for a LayerPlan."""
 
-    __slots__ = ("layer_plan", "size", "store", "flags")
+    __slots__ = ("layer_plan", "size", "store", "flags", "_non_unary_overrides")
 
     def __init__(
         self,
@@ -26,6 +26,10 @@ class Bucket:
         self.store: dict[int, list[Any] | Any] = {}
         # step_id -> list of flags (one per entry)
         self.flags: dict[int, list[ExecutionEntryFlags]] = {}
+        # Steps that should be treated as non-unary in this bucket,
+        # even if the step object is marked _is_unary = True.
+        # Used by sub-buckets created for array element execution.
+        self._non_unary_overrides: set[int] = set()
 
     def set_unary(self, step_id: int, value: Any) -> None:
         """Set a unary (single) value for a step."""

@@ -51,9 +51,21 @@ class FieldArgs:
         self._args = args
 
     def get_raw(self, name: str) -> Step[Any]:
-        """Get the step for a raw argument value."""
+        """Get the step for a raw argument value.
+
+        If the argument was not provided in the query, returns a constant
+        step producing None (matching the TS behaviour where missing optional
+        args yield an undefined/null step).
+        """
         if name not in self._args:
-            raise KeyError(f"No argument named '{name}'")
+            from ..steps.input_static_leaf import InputStaticLeafStep
+
+            # We are inside a plan resolver which is called within
+            # with_global_layer_plan, so the context is already set.
+            step = InputStaticLeafStep(None)
+            # Cache so repeated calls return the same step
+            self._args[name] = step
+            return step
         return self._args[name]
 
     def __getattr__(self, name: str) -> Any:

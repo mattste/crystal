@@ -82,16 +82,52 @@ def _execute_polymorphic_output(
         else:
             result[key] = execute_output_plan(child_output, bucket, index)
 
+    # Determine which type_keys entries apply to this typename.
+    # This includes the concrete type itself AND any interfaces/abstract
+    # types it implements, since `... on SomeInterface { field }` applies
+    # to all concrete types implementing that interface.
+    applicable_type_names = _get_applicable_type_names(
+        typename, output_plan
+    )
+
     # Then, add type-specific fields (from inline fragments)
-    if typename in output_plan.type_keys:
-        type_keys = output_plan.type_keys[typename]
-        type_children = output_plan.type_children.get(typename, {})
-        for key in type_keys:
-            if key in type_children:
-                child_output, child_step = type_children[key]
-                result[key] = execute_output_plan(child_output, bucket, index)
+    for type_name in applicable_type_names:
+        if type_name in output_plan.type_keys:
+            type_keys = output_plan.type_keys[type_name]
+            type_children = output_plan.type_children.get(type_name, {})
+            for key in type_keys:
+                if key not in result and key in type_children:
+                    child_output, child_step = type_children[key]
+                    result[key] = execute_output_plan(child_output, bucket, index)
 
     return result
+
+
+def _get_applicable_type_names(
+    typename: str, output_plan: OutputPlan
+) -> list[str]:
+    """Get all type names whose inline fragment fields should apply for the
+    given concrete typename.  This includes the concrete type itself plus
+    any interfaces it implements that have type-specific fields."""
+    names = [typename]
+
+    # Access the schema through the output plan's layer plan
+    try:
+        schema = output_plan.layer_plan.operation_plan.schema
+    except AttributeError:
+        return names
+
+    concrete_type = schema.type_map.get(typename)
+    if concrete_type is None:
+        return names
+
+    from graphql import GraphQLObjectType
+    if isinstance(concrete_type, GraphQLObjectType):
+        for iface in concrete_type.interfaces:
+            if iface.name in output_plan.type_keys and iface.name not in names:
+                names.append(iface.name)
+
+    return names
 
 
 def _execute_array_output(
@@ -117,6 +153,13 @@ def _execute_array_output(
         # No element output plan — just return the raw values
         return list(list_value)
 
+    # For object/polymorphic elements that have steps needing execution,
+    # use a sub-bucket to properly execute all dependent steps.
+    if elem_output.mode in ("object", "polymorphic") and len(list_value) > 0:
+        return _execute_array_elements_via_bucket(
+            output_plan, elem_output, step, list_value, bucket
+        )
+
     # For each element, build its output
     result: list[Any] = []
     for item in list_value:
@@ -139,6 +182,152 @@ def _execute_array_output(
         else:
             result.append(item)
 
+    return result
+
+
+def _collect_element_steps(elem_output: OutputPlan, array_step: Any) -> list[Any]:
+    """Collect all steps referenced by an element output plan that depend
+    (directly or transitively) on the array step.  Returns them in
+    topological (registration-id) order."""
+    from ..step import Step
+
+    # Gather every step referenced by the element output plan
+    referenced: set[int] = set()
+
+    def _gather_from_output(op: OutputPlan) -> None:
+        if op.root_step is not None:
+            referenced.add(op.root_step.id)
+        if op.typename_step is not None:
+            referenced.add(op.typename_step.id)
+        for _key, (child_out, child_step) in op.children.items():
+            if child_step is not None:
+                referenced.add(child_step.id)
+            _gather_from_output(child_out)
+        for _tn, tc in op.type_children.items():
+            for _key, (child_out, child_step) in tc.items():
+                if child_step is not None:
+                    referenced.add(child_step.id)
+                _gather_from_output(child_out)
+        if op.element_output is not None:
+            _gather_from_output(op.element_output)
+
+    _gather_from_output(elem_output)
+
+    # Now walk backwards from every referenced step to collect all transitive
+    # dependencies (stopping at the array_step which is the "root" for elements).
+    needed: set[int] = set()
+    array_step_id = array_step.id
+
+    def _walk(step: Step) -> None:  # type: ignore[type-arg]
+        if step.id in needed:
+            return
+        if step.id == array_step_id:
+            # Don't add the array step itself – it's the input, not something
+            # to execute.
+            return
+        needed.add(step.id)
+        for dep in step.dependencies:
+            _walk(dep)
+
+    all_steps = array_step.operation_plan.step_tracker.all_steps()
+    for sid in list(referenced):
+        for s in all_steps:
+            if s.id == sid:
+                _walk(s)
+                break
+
+    # Return in registration order (topological order).
+    return [s for s in all_steps if s.id in needed]
+
+
+def _execute_array_elements_via_bucket(
+    array_output: OutputPlan,
+    elem_output: OutputPlan,
+    array_step: Any,
+    items: list | tuple,
+    parent_bucket: Bucket,
+) -> list[Any]:
+    """Execute element-level steps in a sub-bucket so that polymorphic
+    resolution, nested plan resolvers, and type-specific fields all work."""
+    from ..step import ExecutionDetails, ExecutionValue
+    from .execute_bucket import _execute_step
+
+    n = len(items)
+    sub_bucket = Bucket(parent_bucket.layer_plan, n)
+
+    # Store the individual items under the array_step's ID.
+    # This makes them available as a batch to steps that depend on the
+    # array_step (e.g. AccessStep for field extraction, LambdaStep for
+    # __typename resolution).
+    sub_bucket.store[array_step.id] = list(items)
+    # Mark the array_step as non-unary in this sub-bucket so that
+    # _get_step_value indexes into the list per element.
+    sub_bucket._non_unary_overrides.add(array_step.id)
+
+    # Copy unary values from the parent bucket (context, constants, etc.)
+    for step_id, value in parent_bucket.store.items():
+        if step_id == array_step.id:
+            continue
+        step_obj = array_step.operation_plan.step_tracker.get_step_by_id(step_id)
+        if step_obj is not None and step_obj._is_unary:
+            sub_bucket.store[step_id] = value
+
+    # Collect and execute all steps needed by the element output plan.
+    steps_to_exec = _collect_element_steps(elem_output, array_step)
+
+    for s in steps_to_exec:
+        if s._no_exec:
+            continue
+        # Build execution values for each dependency.
+        dep_values: list[ExecutionValue] = []
+        for dep in s.dependencies:
+            dep_id = dep.id
+            if dep_id in sub_bucket.store:
+                stored = sub_bucket.store[dep_id]
+                # In the sub-bucket the array_step's value is a list of items
+                # (non-unary), but other steps that were unary in the parent
+                # bucket remain unary.  Check the override set first.
+                if dep_id in sub_bucket._non_unary_overrides:
+                    dep_values.append(ExecutionValue(entries=stored))
+                elif dep._is_unary:
+                    dep_values.append(
+                        ExecutionValue(is_unary=True, unary_value=stored)
+                    )
+                else:
+                    if isinstance(stored, list):
+                        dep_values.append(ExecutionValue(entries=stored))
+                    else:
+                        dep_values.append(
+                            ExecutionValue(is_unary=True, unary_value=stored)
+                        )
+            else:
+                dep_values.append(
+                    ExecutionValue(is_unary=True, unary_value=None)
+                )
+
+        details = ExecutionDetails(count=n, values=dep_values)
+        details._bucket = sub_bucket  # type: ignore[attr-defined]
+
+        try:
+            results = s.execute(details)
+        except Exception as e:
+            from ..error import FlaggedValue
+            from ..constants import FLAG_ERROR
+            flagged = FlaggedValue(FLAG_ERROR, e)
+            results = [flagged] * n
+
+        # Store results as a list and mark as non-unary in this bucket
+        sub_bucket.store[s.id] = results
+        sub_bucket._non_unary_overrides.add(s.id)
+
+    # Now read out results using the element output plan.
+    result: list[Any] = []
+    for i in range(n):
+        item = items[i]
+        if item is None or is_flagged_value(item):
+            result.append(None)
+        else:
+            result.append(execute_output_plan(elem_output, sub_bucket, i))
     return result
 
 
@@ -249,8 +438,8 @@ def _get_step_value(step: Any, bucket: Bucket, index: int) -> Any:
 
     stored = bucket.store[step_id]
 
-    # If step is unary or stored value is not a list, return directly
-    if step._is_unary:
+    # If step is unary (and not overridden in this bucket), return directly
+    if step._is_unary and step_id not in bucket._non_unary_overrides:
         return stored
 
     # Otherwise index into the list
