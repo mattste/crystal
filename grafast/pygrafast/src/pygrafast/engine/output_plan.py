@@ -42,5 +42,9 @@ class OutputPlan:
         # type plans: type_name -> (keys_list, type_obj)
         self.type_plans: dict[str, tuple[list[str], Any]] = {}
 
+        # type-specific root steps: type_name -> Step
+        # These come from planForType and hold the loaded data for each concrete type
+        self.type_steps: dict[str, Step[Any]] = {}
+
         # For array mode: the output plan for each element
         self.element_output: OutputPlan | None = None

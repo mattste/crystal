@@ -223,13 +223,37 @@ class OperationPlan:
             if type_name not in output_plan.type_plans:
                 output_plan.type_plans[type_name] = ([], target_type)
 
+            # If planForType is available and this is a concrete type,
+            # call it to get a type-specific step for field access.
+            effective_parent = parent_step
+            if (output_plan.plan_for_type is not None
+                    and isinstance(target_type, GraphQLObjectType)
+                    and type_name not in output_plan.type_steps):
+                plan_for_type_fn = output_plan.plan_for_type
+
+                def call_plan_for_type(
+                    t: Any = target_type,
+                    fn: Any = plan_for_type_fn,
+                ) -> Step[Any] | None:
+                    return fn(t)
+
+                type_step = with_global_layer_plan(
+                    layer_plan, None, call_plan_for_type
+                )
+                if type_step is not None:
+                    output_plan.type_steps[type_name] = type_step
+                    effective_parent = type_step
+
+            if type_name in output_plan.type_steps:
+                effective_parent = output_plan.type_steps[type_name]
+
             if fragment.selection_set:
                 for sel in fragment.selection_set.selections:
                     if isinstance(sel, FieldNode):
                         self._plan_field(
                             sel,
                             target_type,
-                            parent_step,
+                            effective_parent,
                             output_plan,
                             layer_plan,
                             type_condition=type_name,
@@ -238,7 +262,7 @@ class OperationPlan:
                         self._plan_inline_fragment(
                             sel,
                             target_type,
-                            parent_step,
+                            effective_parent,
                             output_plan,
                             layer_plan,
                         )
