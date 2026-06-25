@@ -70,7 +70,7 @@ class Step(Generic[TData]):
     # Subclasses should set this
     _no_exec: bool = False
     is_sync_and_safe: bool = False
-    has_side_effects: bool = False
+    _has_side_effects: bool = False
     allow_multiple_optimizations: bool = False
 
     def __init__(self) -> None:
@@ -90,8 +90,28 @@ class Step(Generic[TData]):
         self._dependency_forbidden_flags: list[ExecutionEntryFlags] = []
         self._dependents: list[tuple[Step[Any], int]] = []
 
+        # Capture the current latest side effect step from the layer plan.
+        # If a prior step in this layer has side effects and it errors,
+        # this step will be inhibited (error propagated, execution skipped).
+        self.implicit_side_effect_step: Step[Any] | None = (
+            self.layer_plan.latest_side_effect_step
+        )
+
         # Register with layer plan (sets self.id)
         self.id: int = self.layer_plan._add_step(self)
+
+    @property
+    def has_side_effects(self) -> bool:
+        return self._has_side_effects
+
+    @has_side_effects.setter
+    def has_side_effects(self, value: bool) -> None:
+        self._has_side_effects = value
+        if value:
+            # Update the layer plan's latest side effect step pointer.
+            # Steps created after this one will capture this step as their
+            # implicit_side_effect_step, forming a chain.
+            self.layer_plan.latest_side_effect_step = self
 
     @property
     def dependencies(self) -> Sequence[Step[Any]]:

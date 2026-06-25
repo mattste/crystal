@@ -83,11 +83,45 @@ class LayerPlan:
         return step_id
 
     def finalize(self) -> None:
-        """Build execution phases from the registered steps."""
-        # For now, a single phase containing all steps in registration order,
-        # filtered to only executable ones (not __ValueStep etc.)
+        """Build execution phases from the registered steps.
+
+        Side-effect steps are placed in their own dedicated phases so they
+        execute sequentially.  Non-side-effect steps are grouped into
+        phases around the side-effect boundaries.
+        """
         executable = [s for s in self.steps if not getattr(s, "_no_exec", False)]
-        if executable:
-            self.phases = [executable]
-        else:
+        if not executable:
             self.phases = []
+            return
+
+        # Check if any step has side effects
+        has_any_side_effects = any(
+            getattr(s, "has_side_effects", False) for s in executable
+        )
+
+        if not has_any_side_effects:
+            # No side effects — single phase as before
+            self.phases = [executable]
+            return
+
+        # Build phases: side-effect steps get their own phase,
+        # consecutive non-side-effect steps are grouped together.
+        phases: list[list[Step[Any]]] = []
+        current_group: list[Step[Any]] = []
+
+        for step in executable:
+            if getattr(step, "has_side_effects", False):
+                # Flush any accumulated non-side-effect steps
+                if current_group:
+                    phases.append(current_group)
+                    current_group = []
+                # Side-effect step gets its own phase
+                phases.append([step])
+            else:
+                current_group.append(step)
+
+        # Flush remaining non-side-effect steps
+        if current_group:
+            phases.append(current_group)
+
+        self.phases = phases

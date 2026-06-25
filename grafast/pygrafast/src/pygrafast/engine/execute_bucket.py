@@ -82,6 +82,28 @@ def _get_dep_flags(dep: Step[Any], bucket: Bucket, index: int) -> ExecutionEntry
 
 def _execute_step(step: Step[Any], bucket: Bucket) -> None:
     """Execute a single step within a bucket."""
+    # Check if a prior side-effect step errored. If so, propagate the
+    # error to this step without executing it.  This implements the
+    # cancellation of steps that follow a failed side effect.
+    se_step = step.implicit_side_effect_step
+    if se_step is not None and se_step.id in bucket.store:
+        se_stored = bucket.store[se_step.id]
+        if is_flagged_value(se_stored) and (se_stored.flag & FLAG_ERROR):
+            # Propagate the error from the side effect step
+            bucket.store[step.id] = se_stored
+            bucket.flags[step.id] = [se_stored.flag] * max(bucket.size, 1)
+            return
+        # For non-unary side effect results, check per-entry
+        if isinstance(se_stored, list):
+            for val in se_stored:
+                if is_flagged_value(val) and (val.flag & FLAG_ERROR):
+                    bucket.store[step.id] = se_stored
+                    bucket.flags[step.id] = [
+                        v.flag if is_flagged_value(v) else NO_FLAGS
+                        for v in se_stored
+                    ]
+                    return
+
     # Check if any dependency value is flagged and forbidden for this step.
     # If so, propagate the flagged value instead of executing the step.
     # This mirrors the TS behaviour where the bucket execution checks

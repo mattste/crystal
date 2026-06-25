@@ -12,6 +12,7 @@ from .flag_step import (
 )
 from .lambda_step import LambdaStep, lambda_
 from .list_step import ListStep, list_
+from .side_effect import SideEffectStep, side_effect
 from .value_step import ValueStep
 
 __all__ = [
@@ -19,6 +20,7 @@ __all__ = [
     "FlagStep",
     "LambdaStep",
     "ListStep",
+    "SideEffectStep",
     "TRAP_ERROR",
     "TRAP_ERROR_OR_INHIBITED",
     "TRAP_INHIBITED",
@@ -28,5 +30,6 @@ __all__ = [
     "inhibit_on_null",
     "lambda_",
     "list_",
+    "side_effect",
     "trap",
 ]
