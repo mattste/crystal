@@ -671,6 +671,20 @@ class OperationPlan:
                     )
 
                 arg_steps[arg_name] = step
+            else:
+                # Argument not provided in the query -- use default if defined
+                from graphql.pyutils import Undefined as _GQLUndefined
+                from ..steps.input_static_leaf import InputStaticLeafStep
+
+                default = arg_def.default_value
+                if default is not _GQLUndefined:
+                    def make_arg_default(val: Any = default) -> InputStaticLeafStep:
+                        return InputStaticLeafStep(val)
+
+                    step = with_global_layer_plan(
+                        layer_plan, None, make_arg_default
+                    )
+                    arg_steps[arg_name] = step
 
         return arg_steps
 
